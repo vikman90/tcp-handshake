@@ -19,9 +19,13 @@
 #define BUF_SIZE 4096
 
 #define print(format, ...) printf(format "\n", ##__VA_ARGS__)
-#define error(format, ...) fprintf(stderr, "ERROR (%d): " format "\n", (int)getpid(), ##__VA_ARGS__)
-#define debug(format, ...) if (debug_flag) fprintf(stderr, "DEBUG (%d): " format "\n", (int)getpid(), ##__VA_ARGS__)
-#define verbose(format, ...) if (verbose_flag) printf(format "\n", ##__VA_ARGS__)
+#define error(format, ...) fprintf(stderr, "\e[31mERROR (%d)\e[0m: " format "\n", (int)getpid(), ##__VA_ARGS__)
+#define error2(format, ...) fprintf(stderr, "\e[31mERROR (%d)\e[0m: " format ": %s (%d)\n", (int)getpid(), ##__VA_ARGS__, strerror(errno), errno)
+#define warn(format, ...) fprintf(stderr, "\e[33mWARN (%d)\e[0m: " format "\n", (int)getpid(), ##__VA_ARGS__)
+#define warn2(format, ...) fprintf(stderr, "\e[33mWARN (%d)\e[0m: " format ": %s (%d)\n", (int)getpid(), ##__VA_ARGS__, strerror(errno), errno)
+#define info(format, ...) fprintf(stderr, "\e[32mINFO (%d)\e[0m: " format "\n", (int)getpid(), ##__VA_ARGS__)
+#define debug(format, ...) if (debug_flag) fprintf(stderr, "\e[34mDEBUG (%d)\e[0m: " format "\n", (int)getpid(), ##__VA_ARGS__)
+#define verbose(format, ...) if (verbose_flag) printf("\e[32mINFO (%d)\e[0m: " format "\n", (int)getpid(), ##__VA_ARGS__)
 
 static const char * HC_STARTUP = "HC_STARTUP";
 static const char * HC_ACK = "HC_ACK";

@@ -6,6 +6,7 @@ static int verbose_flag;
 static struct timespec delay;
 static in_port_t port = DEF_PORT;
 static struct timeval timeout;
+static size_t acc_recv;
 
 static void handler(int signum) {
     debug("%s received (%d)", strsignal(signum), signum);
@@ -55,7 +56,7 @@ static void options(int argc, char * const argv[]) {
                 continue;
             }
 
-            if (ms = atol(optarg), ms <= 0) {
+            if (ms = atol(optarg), ms < 0) {
                 error("Option -%c needs a positive argument.", c);
                 continue;
             }
@@ -124,7 +125,7 @@ int main(int argc, char ** argv) {
 
     debug("socket()");
     if (sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP), sock < 0) {
-        perror("socket()");
+        error2("socket()");
         return EXIT_FAILURE;
     }
 
@@ -133,7 +134,7 @@ int main(int argc, char ** argv) {
 
         debug("setsockopt(REUSEADDR)");
         if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
-            perror("setsockopt(REUSEADDR)");
+            error2("setsockopt(REUSEADDR)");
             return EXIT_FAILURE;
         }
     }
@@ -142,32 +143,32 @@ int main(int argc, char ** argv) {
         debug("setsockopt(SO_RCVTIMEO)");
 
         if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-            perror("setsockopt(SO_RCVTIMEO)");
+            error2("setsockopt(SO_RCVTIMEO)");
             return EXIT_FAILURE;
         }
     }
 
     debug("bind(%hu)", port);
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind()");
+        error2("bind()");
         return EXIT_FAILURE;
     }
 
     debug("listen(%d)", SOMAXCONN);
     if (listen(sock, SOMAXCONN) < 0) {
-        perror("listen()");
+        error2("listen()");
         return EXIT_FAILURE;
     }
 
     if (epfd = epoll_create(POLL_SIZE), epfd < 0) {
-        perror("epoll_create()");
+        error2("epoll_create()");
         return EXIT_FAILURE;
     }
 
     request.data.fd = sock;
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sock, &request) < 0) {
-        perror("epoll_ctl() [1]");
+        error2("epoll_ctl() [1]");
         return EXIT_FAILURE;
     }
 
@@ -175,7 +176,7 @@ int main(int argc, char ** argv) {
         debug("epoll_wait()");
         if (nevents = epoll_wait(epfd, events, POLL_SIZE, -1), nevents < 0) {
             if (errno != EINTR) {
-                perror("epoll_wait()");
+                error2("epoll_wait()");
             }
 
             continue;
@@ -187,23 +188,24 @@ int main(int argc, char ** argv) {
             if (events[i].data.fd == sock) {
                 debug("accept()");
                 if (request.data.fd = accept(sock, NULL, NULL), request.data.fd < 0) {
-                    perror("accept()");
+                    error2("accept()");
                     continue;
                 }
 
                 print("New connection (%d).", ++nconn);
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, request.data.fd, &request) < 0) {
-                    perror("epoll_ctl() [2]");
+                    error2("epoll_ctl() [2]");
                     close(request.data.fd);
                     nconn--;
                 }
             } else {
                 debug("recv()");
+                nrecv = recv(events[i].data.fd, (void *)&length, sizeof(length), MSG_WAITALL);
 
-                switch (recv(events[i].data.fd, (void *)&length, sizeof(length), MSG_WAITALL)) {
+                switch (nrecv) {
                 case -1:
-                    perror("recv()");
+                    error2("recv()");
                     close(events[i].data.fd);
                     nconn--;
                     break;
@@ -215,31 +217,46 @@ int main(int argc, char ** argv) {
                     break;
 
                 default:
+                    acc_recv += nrecv;
                     nrecv = recv(events[i].data.fd, buffer, length, MSG_WAITALL);
 
                     if (nrecv != (ssize_t)length) {
-                        error("Incorrect message size from client %d: expecting %u, got %d", events[i].data.fd, length, (int)nrecv);
+                        warn2("Incorrect message size from client %d: expecting %u, got %d", events[i].data.fd, length, (int)nrecv);
                         close(events[i].data.fd);
                         nconn--;
+
+                        if (nrecv > 0) {
+                            acc_recv += nrecv;
+                        }
+
                         break;
                     }
 
                     buffer[nrecv] = '\0';
+                    acc_recv += nrecv;
 
                     if (strcmp(buffer, HC_STARTUP) == 0) {
                         debug("Client %d sent startup.", events[i].data.fd);
 
                         length = strlen(HC_ACK);
                         debug("send(\"%s\")", HC_ACK);
+                        *(uint32_t *)buffer = length;
+                        memcpy(buffer + sizeof(length), HC_ACK, length);
+                        length += sizeof(length);
 
-                        if (send(events[i].data.fd, (void *)&length, sizeof(length), 0) < 0 || send(events[i].data.fd, HC_ACK, length, 0) < 0) {
-                            perror("send(\"HC_ACK\")");
+                        nrecv = send(events[i].data.fd, buffer, length, 0);
+
+                        if (nrecv != (ssize_t)length) {
+                            error2("send(\"HC_ACK\")");
                             close(events[i].data.fd);
                             nconn--;
                         }
                     } else {
                         verbose("Received from %d: %.10s (%zd)", events[i].data.fd, buffer, nrecv);
-                        nanosleep(&delay, NULL);
+
+                        if (delay.tv_sec || delay.tv_nsec) {
+                            nanosleep(&delay, NULL);
+                        }
                     }
                 }
             }
@@ -248,6 +265,7 @@ int main(int argc, char ** argv) {
 
     close(sock);
     close(epfd);
+    info("Bytes received: %zu", acc_recv);
     verbose("Exiting.");
     return EXIT_SUCCESS;
 }

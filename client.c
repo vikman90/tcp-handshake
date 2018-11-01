@@ -36,7 +36,7 @@ void help(const char * argv0, int result) {
     print("    -l <ms>     Message latency. Default: 10 ms.");
     print("    -n <host>   Hostname (instead of IP).");
     print("    -p <port>   Port number.");
-    print("    -s <size>   Message size.");
+    print("    -s <size>   Message size. Default: 1024 bytes.");
     print("    -t <ms>     Sending timeout. Default: infinity.");
     print("    -v          Verbose mode (show messages).");
     exit(result);
@@ -72,8 +72,8 @@ static void options(int argc, char * const argv[]) {
                 continue;
             }
 
-            if (ms = atol(optarg), ms <= 0) {
-                error("Option -%c needs a positive argument.", c);
+            if (ms = atol(optarg), ms < 0) {
+                error("Option -%c needs a nonegative argument.", c);
                 continue;
             }
 
@@ -114,8 +114,8 @@ static void options(int argc, char * const argv[]) {
             if (size = atoi(optarg), size <= 0) {
                 error("Option -%c needs a positive argument.", c);
                 continue;
-            } else if (size > BUF_SIZE) {
-                error("Option -%c requires a number lower than %d", c, BUF_SIZE);
+            } else if (size >= (int)(BUF_SIZE - sizeof(uint32_t))) {
+                error("Option -%c requires a number lower than %d", c, (int)(BUF_SIZE - sizeof(uint32_t)));
                 continue;
             }
 
@@ -161,7 +161,7 @@ void server_connect() {
 
     debug("socket()");
     if (sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP), sock < 0) {
-        perror("socket()");
+        error2("socket()");
         exit(EXIT_FAILURE);
     }
 
@@ -169,7 +169,7 @@ void server_connect() {
         debug("setsockopt(SO_SNDTIMEO)");
 
         if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
-            perror("setsockopt(SO_SNDTIMEO)");
+            error2("setsockopt(SO_SNDTIMEO)");
             exit(EXIT_FAILURE);
         }
     }
@@ -197,8 +197,9 @@ void server_connect() {
 
         debug("connect()");
         if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            perror("connect()");
+            warn2("connect()");
             sleep(1);
+            continue;
         }
 
         debug("Connection stablished (not yet handshaked).");
@@ -219,7 +220,7 @@ void server_handshake() {
 
         debug("send(\"%u\")", length);
         if (send(sock, (void *)&length, sizeof(length), 0) < 0) {
-            perror("send(\"length(HC_STARTUP)\") [1]");
+            warn2("send(\"length(HC_STARTUP)\") [1]");
             sleep(1);
             server_connect();
             continue;
@@ -227,7 +228,7 @@ void server_handshake() {
 
         debug("send(\"%s\")", HC_STARTUP);
         if (send(sock, HC_STARTUP, length, 0) < 0) {
-            perror("send(\"HC_STARTUP\") [2]");
+            error2("send(\"HC_STARTUP\") [2]");
             sleep(1);
             server_connect();
             continue;
@@ -237,7 +238,7 @@ void server_handshake() {
 
         switch (recv(sock, (void *)&length, sizeof(length), MSG_WAITALL)) {
         case -1:
-            perror("recv()");
+            error2("recv()");
             sleep(1);
             server_connect();
             continue;
@@ -277,7 +278,7 @@ void fill_random(char * buffer, size_t msg_size) {
     size_t i;
 
     for (i = strlen(buffer); i < msg_size; i++) {
-        buffer[i] = random() % (sizeof(text) - 1);
+        buffer[i] = text[random() % (sizeof(text) - 1)];
     }
 }
 
@@ -297,32 +298,38 @@ int main(int argc, char ** argv) {
     srandom(time(NULL));
     pid = getpid();
 
+    *(uint32_t *)buffer = msg_size;
+
+    if (size = snprintf(buffer + sizeof(uint32_t), sizeof(buffer) - sizeof(uint32_t), "%d: ", (int)pid), (size_t)size > msg_size) {
+        error("Composing message. Size too small?");
+        return EXIT_FAILURE;
+    }
+
+    fill_random(buffer + sizeof(uint32_t), msg_size);
+    length = msg_size + sizeof(uint32_t);
+    buffer[length] = '\0';
+
     while (1) {
-        if (size = snprintf(buffer, sizeof(buffer), "%d: ", pid), (size_t)size > msg_size) {
-            error("Composing message. Size too small?");
-            return EXIT_FAILURE;
-        }
-
-        fill_random(buffer, msg_size);
-        buffer[msg_size] = '\0';
-
         debug("send()");
 
-        length = msg_size;
+        nsend = send(sock, buffer, length, 0);
 
-        if (nsend = send(sock, (void *)&length, sizeof(length), 0), nsend < 0) {
+        if (nsend < 0) {
             if (errno == EPIPE) {
                 print("Connection lost [1].");
                 server_handshake();
             } else {
-                perror("send(1)");
+                warn2("send(1)");
             }
-        } else if ((size_t)nsend != sizeof(length)) {
-            error("send(): expected %zu, got %zd", sizeof(length), nsend);
+        } else if ((size_t)nsend != length) {
+            warn2("send(): expected %u, got %zd", length, nsend);
+            server_handshake();
         } else {
-            send(sock, buffer, msg_size, 0);
-            verbose("Sent: %.80s", buffer);
-            nanosleep(&delay, NULL);
+            verbose("Sent: %.80s", buffer + sizeof(uint32_t));
+
+            if (delay.tv_sec || delay.tv_nsec) {
+                nanosleep(&delay, NULL);
+            }
         }
     }
 
