@@ -7,6 +7,8 @@ static struct timespec delay;
 static in_port_t port = DEF_PORT;
 static struct timeval timeout;
 static size_t acc_recv;
+static netbuffer_t netbuffer;
+int nconn;
 
 static void handler(int signum) {
     debug("%s received (%d)", strsignal(signum), signum);
@@ -104,15 +106,43 @@ static void options(int argc, char * const argv[]) {
     }
 }
 
+int dispatch(int sock, char * data, unsigned long size) {
+    uint32_t length;
+    long nsend;
+    char buffer[BUF_SIZE + 1];
+
+    if (strncmp(data, HC_STARTUP, strlen(HC_STARTUP)) == 0) {
+        debug("Client %d sent startup.", sock);
+
+        length = strlen(HC_ACK);
+        *(uint32_t *)buffer = length;
+        memcpy(buffer + sizeof(length), HC_ACK, length);
+        length += sizeof(length);
+
+        debug("send(\"%s\")", HC_ACK);
+        nsend = send(sock, buffer, length, 0);
+
+        if (nsend != (ssize_t)length) {
+            error2("send(\"HC_ACK\")");
+            return -1;
+        }
+    } else {
+        verbose("Received from %d: %.10s (%lu)", sock, data, size);
+
+        if (delay.tv_sec || delay.tv_nsec) {
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     int sock;
     int epfd;
     int nevents;
     int i;
-    int nconn = 0;
-    ssize_t nrecv;
-    uint32_t length;
-    char buffer[BUF_SIZE + 1];
+    long nrecv;
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
     struct epoll_event request = { .events = EPOLLIN };
     struct epoll_event events[POLL_SIZE] = { { .events = 0 } };
@@ -192,72 +222,27 @@ int main(int argc, char ** argv) {
                     continue;
                 }
 
-                print("New connection (%d).", ++nconn);
+                nb_open(&netbuffer, request.data.fd);
+                print("New connection (%d).", nconn);
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, request.data.fd, &request) < 0) {
                     error2("epoll_ctl() [2]");
-                    close(request.data.fd);
-                    nconn--;
+                    nb_close(&netbuffer, request.data.fd);
                 }
             } else {
                 debug("recv()");
-                nrecv = recv(events[i].data.fd, (void *)&length, sizeof(length), MSG_WAITALL);
+                nrecv = nb_recv(&netbuffer.buffers[events[i].data.fd], events[i].data.fd, dispatch);
 
                 switch (nrecv) {
                 case -1:
                     error2("recv()");
-                    close(events[i].data.fd);
-                    nconn--;
+                    nb_close(&netbuffer, request.data.fd);
                     break;
 
                 case 0:
-                    print("Socket %d closed (%d).", events[i].data.fd, --nconn);
-                    close(events[i].data.fd);
-                    nconn--;
+                    nb_close(&netbuffer, request.data.fd);
+                    print("Socket %d closed (%d).", events[i].data.fd, nconn);
                     break;
-
-                default:
-                    acc_recv += nrecv;
-                    nrecv = recv(events[i].data.fd, buffer, length, MSG_WAITALL);
-
-                    if (nrecv != (ssize_t)length) {
-                        warn2("Incorrect message size from client %d: expecting %u, got %d", events[i].data.fd, length, (int)nrecv);
-                        close(events[i].data.fd);
-                        nconn--;
-
-                        if (nrecv > 0) {
-                            acc_recv += nrecv;
-                        }
-
-                        break;
-                    }
-
-                    buffer[nrecv] = '\0';
-                    acc_recv += nrecv;
-
-                    if (strcmp(buffer, HC_STARTUP) == 0) {
-                        debug("Client %d sent startup.", events[i].data.fd);
-
-                        length = strlen(HC_ACK);
-                        debug("send(\"%s\")", HC_ACK);
-                        *(uint32_t *)buffer = length;
-                        memcpy(buffer + sizeof(length), HC_ACK, length);
-                        length += sizeof(length);
-
-                        nrecv = send(events[i].data.fd, buffer, length, 0);
-
-                        if (nrecv != (ssize_t)length) {
-                            error2("send(\"HC_ACK\")");
-                            close(events[i].data.fd);
-                            nconn--;
-                        }
-                    } else {
-                        verbose("Received from %d: %.10s (%zd)", events[i].data.fd, buffer, nrecv);
-
-                        if (delay.tv_sec || delay.tv_nsec) {
-                            nanosleep(&delay, NULL);
-                        }
-                    }
                 }
             }
         }
@@ -268,4 +253,74 @@ int main(int argc, char ** argv) {
     info("Bytes received: %zu", acc_recv);
     verbose("Exiting.");
     return EXIT_SUCCESS;
+}
+
+void nb_open(netbuffer_t * buffer, int sock) {
+    if (sock >= buffer->max_fd) {
+        buffer->buffers = realloc(buffer->buffers, sizeof(sockbuffer_t) * (sock + 1));
+        buffer->max_fd = sock;
+    }
+
+    memset(buffer->buffers + sock, 0, sizeof(sockbuffer_t));
+    ++nconn;
+}
+
+int nb_close(netbuffer_t * buffer, int sock) {
+    int retval = close(sock);
+
+    if (!retval) {
+        free(buffer->buffers[sock].data);
+        memset(buffer->buffers + sock, 0, sizeof(sockbuffer_t));
+        --nconn;
+    }
+
+    return retval;
+}
+
+int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * data, unsigned long)) {
+    unsigned long data_ext = buffer->data_len + BUF_SIZE;
+    long recv_len;
+    unsigned long i;
+    unsigned long cur_offset;
+    uint32_t cur_len;
+    int retval = 0;
+
+    // Extend data buffer
+
+    if (data_ext > buffer->data_size) {
+        buffer->data = realloc(buffer->data, data_ext);
+        buffer->data_size = data_ext;
+    }
+
+    // Receive and append
+
+    recv_len = recv(sock, buffer->data + buffer->data_len, BUF_SIZE, 0);
+
+    if (recv_len < 0) {
+        return recv_len;
+    }
+
+    acc_recv += recv_len;
+
+    // Dispatch as most messages as possible
+
+    for (i = 0; i + sizeof(uint32_t) <= buffer->data_len && !retval; i = cur_offset + cur_len) {
+        cur_len = *(uint32_t *)(buffer->data + i);
+        cur_offset = i + sizeof(uint32_t);
+
+        if (cur_offset + cur_len > buffer->data_len) {
+            break;
+        }
+
+        retval = callback(sock, buffer->data + cur_offset, cur_len);
+        recv_len = cur_len;
+    }
+
+    // Move remaining data to data start
+
+    if (buffer->data_len - i > 0) {
+        memcpy(buffer->data, buffer + i, buffer->data_len - i);
+    }
+
+    return retval ? retval : recv_len;
 }

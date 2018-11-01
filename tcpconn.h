@@ -31,3 +31,18 @@ static const char * HC_STARTUP = "HC_STARTUP";
 static const char * HC_ACK = "HC_ACK";
 
 static void help(const char * argv0, int result) __attribute__ ((noreturn));
+
+typedef struct sockbuffer_t {
+    char * data;
+    unsigned long data_size;
+    unsigned long data_len;
+} sockbuffer_t;
+
+typedef struct netbuffer_t {
+    int max_fd;
+    sockbuffer_t * buffers;
+} netbuffer_t;
+
+void nb_open(netbuffer_t * buffer, int sock);
+int nb_close(netbuffer_t * buffer, int sock);
+int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * data, unsigned long));
