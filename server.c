@@ -8,13 +8,17 @@ static in_port_t port = DEF_PORT;
 static struct timeval timeout;
 static size_t acc_recv;
 static netbuffer_t netbuffer;
-int nconn;
+static int nconn;
+static struct timespec c_begin;
+static struct timespec c_end;
+static struct timespec c_diff;
 
 static void handler(int signum) {
     debug("%s received (%d)", strsignal(signum), signum);
 
     switch (signum) {
     case SIGINT:
+        putchar('\n');
         running = 0;
         break;
 
@@ -108,6 +112,7 @@ static void options(int argc, char * const argv[]) {
 
 int dispatch(int sock, char * data, unsigned long size) {
     uint32_t length;
+    uint32_t * header;
     long nsend;
     char buffer[BUF_SIZE + 1];
 
@@ -115,7 +120,8 @@ int dispatch(int sock, char * data, unsigned long size) {
         debug("Client %d sent startup.", sock);
 
         length = strlen(HC_ACK);
-        *(uint32_t *)buffer = length;
+        header = (uint32_t *)buffer;
+        *header = length;
         memcpy(buffer + sizeof(length), HC_ACK, length);
         length += sizeof(length);
 
@@ -203,8 +209,9 @@ int main(int argc, char ** argv) {
     }
 
     while (running) {
-        debug("epoll_wait()");
-        if (nevents = epoll_wait(epfd, events, POLL_SIZE, -1), nevents < 0) {
+        nevents = epoll_wait(epfd, events, POLL_SIZE, -1);
+
+        if (nevents < 0) {
             if (errno != EINTR) {
                 error2("epoll_wait()");
             }
@@ -213,6 +220,10 @@ int main(int argc, char ** argv) {
         }
 
         debug("New events: %d", nevents);
+
+        if (!c_begin.tv_sec) {
+            clock_gettime(CLOCK_MONOTONIC, &c_begin);
+        }
 
         for (i = 0; i < nevents; i++) {
             if (events[i].data.fd == sock) {
@@ -223,34 +234,49 @@ int main(int argc, char ** argv) {
                 }
 
                 nb_open(&netbuffer, request.data.fd);
-                print("New connection (%d).", nconn);
+                info("New connection: %d (%d)", request.data.fd, nconn);
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, request.data.fd, &request) < 0) {
                     error2("epoll_ctl() [2]");
                     nb_close(&netbuffer, request.data.fd);
                 }
             } else {
-                debug("recv()");
                 nrecv = nb_recv(&netbuffer.buffers[events[i].data.fd], events[i].data.fd, dispatch);
 
                 switch (nrecv) {
                 case -1:
-                    error2("recv()");
-                    nb_close(&netbuffer, request.data.fd);
+                    error2("recv(%d)", events[i].data.fd);
+                    nb_close(&netbuffer, events[i].data.fd);
                     break;
 
                 case 0:
-                    nb_close(&netbuffer, request.data.fd);
-                    print("Socket %d closed (%d).", events[i].data.fd, nconn);
+                    info("Socket %d closed (%d).", events[i].data.fd, nconn);
+                    nb_close(&netbuffer, events[i].data.fd);
                     break;
                 }
             }
         }
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &c_end);
+
+    c_diff.tv_sec = c_end.tv_sec - c_begin.tv_sec;
+    c_diff.tv_nsec = c_end.tv_nsec - c_begin.tv_nsec;
+
+    if (c_diff.tv_nsec < 0) {
+        c_diff.tv_sec--;
+        c_diff.tv_nsec += 1000000000;
+    }
+
     close(sock);
     close(epfd);
-    info("Bytes received: %zu", acc_recv);
+    info("Data received: %zu MB", acc_recv / 1000000);
+
+    if (c_begin.tv_sec) {
+        info("Time: %f sec.", (c_diff.tv_sec + (double)c_diff.tv_nsec / 1000000000));
+        info("Throughput: %f Mbps.", (double)acc_recv / (c_diff.tv_sec * 1000000 + (double)c_diff.tv_nsec / 1000000) * 8);
+    }
+
     verbose("Exiting.");
     return EXIT_SUCCESS;
 }
@@ -268,7 +294,10 @@ void nb_open(netbuffer_t * buffer, int sock) {
 int nb_close(netbuffer_t * buffer, int sock) {
     int retval = close(sock);
 
-    if (!retval) {
+    if (retval) {
+        error2("close(%d)", sock);
+        exit(1);
+    } else {
         free(buffer->buffers[sock].data);
         memset(buffer->buffers + sock, 0, sizeof(sockbuffer_t));
         --nconn;
@@ -296,11 +325,12 @@ int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * da
 
     recv_len = recv(sock, buffer->data + buffer->data_len, BUF_SIZE, 0);
 
-    if (recv_len < 0) {
+    if (recv_len <= 0) {
         return recv_len;
     }
 
     acc_recv += recv_len;
+    buffer->data_len += recv_len;
 
     // Dispatch as most messages as possible
 
@@ -318,8 +348,11 @@ int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * da
 
     // Move remaining data to data start
 
-    if (buffer->data_len - i > 0) {
-        memcpy(buffer->data, buffer + i, buffer->data_len - i);
+    if (i > 0 && i < buffer->data_len) {
+        debug("i = %lu, len = %lu, size = %lu", i, buffer->data_len, buffer->data_size);
+        debug("moving %d bytes", (int)(buffer->data_len - i));
+        memcpy(buffer->data, buffer->data + i, buffer->data_len - i);
+        buffer->data_len -= i;
     }
 
     return retval ? retval : recv_len;
