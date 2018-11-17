@@ -114,8 +114,8 @@ static void options(int argc, char * const argv[]) {
             if (size = atoi(optarg), size <= 0) {
                 error("Option -%c needs a positive argument.", c);
                 continue;
-            } else if (size >= (int)(BUF_SIZE - sizeof(uint32_t))) {
-                error("Option -%c requires a number lower than %d", c, (int)(BUF_SIZE - sizeof(uint32_t)));
+            } else if (size >= 2000000000) {
+                error("Option -%c requires a number lower than 2000000000", c);
                 continue;
             }
 
@@ -287,7 +287,7 @@ int main(int argc, char ** argv) {
     int size;
     ssize_t nsend;
     uint32_t length;
-    char buffer[BUF_SIZE + 1];
+    char * buffer;
 
     options(argc, argv);
     signal(SIGINT, handler);
@@ -298,6 +298,7 @@ int main(int argc, char ** argv) {
     srandom(time(NULL));
     pid = getpid();
 
+    buffer = malloc(msg_size + sizeof(uint32_t) + 1);
     *(uint32_t *)buffer = msg_size;
 
     if (size = snprintf(buffer + sizeof(uint32_t), sizeof(buffer) - sizeof(uint32_t), "%d: ", (int)pid), (size_t)size > msg_size) {
