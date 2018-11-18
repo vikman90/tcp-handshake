@@ -1,6 +1,6 @@
 #include "tcpconn.h"
 
-#define perf_bps(bytes, ts) (bytes / (ts.tv_sec + ts.tv_nsec / 1000000000.0))
+#define perf_bps(bytes, ts) (bytes * 8 / (ts.tv_sec + ts.tv_nsec / 1000000000.0))
 
 static volatile int running = 1;
 static int debug_flag;
@@ -50,6 +50,12 @@ void * monitor(void * args) {
     struct timespec c_cur;
     struct timespec c_diff;
     double bps;
+    const char * U_TOTAL[] = { "B", "KB", "MB", "GB", "TB" };
+    const char * U_PERF[] = { "bps", "Kbps", "Mbps", "Gbps" };
+    double p_total;
+    double p_perf;
+    int i_total;
+    int i_perf;
 
     clock_gettime(CLOCK_MONOTONIC, &c_cur);
 
@@ -60,8 +66,18 @@ void * monitor(void * args) {
         bytes_diff = bytes_cur - bytes_old;
         c_diff = timediff(&c_cur, &c_old);
         bps = perf_bps(bytes_diff, c_diff);
+        p_total = bytes_cur;
+        p_perf = bps;
 
-        printf("\r\e[2KTotal: %.3f MB. Performance: %.3f Mbps", bytes_cur / 1048536.0, bps / 1000000);
+        for (i_total = 0; i_total < 5 && p_total >= 1024; ++i_total) {
+            p_total /= 1024;
+        }
+
+        for (i_perf = 0; i_perf < 4 && p_perf >= 1000; ++i_perf) {
+            p_perf /= 1000;
+        }
+
+        printf("\r\e[2KTotal: %.3f %s. Performance: %.3f %s", p_total, U_TOTAL[i_total], p_perf, U_PERF[i_perf]);
         fflush(stdout);
 
         c_old = c_cur;
