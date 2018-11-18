@@ -13,6 +13,7 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
 
 #define DEF_PORT 1516
 #define POLL_SIZE 100

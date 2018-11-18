@@ -1,17 +1,18 @@
 #include "tcpconn.h"
 
+#define perf_bps(bytes, ts) (bytes / (ts.tv_sec + ts.tv_nsec / 1000000000.0))
+
 static volatile int running = 1;
 static int debug_flag;
 static int verbose_flag;
 static struct timespec delay;
 static in_port_t port = DEF_PORT;
 static struct timeval timeout;
-static size_t acc_recv;
+static volatile size_t acc_recv;
 static netbuffer_t netbuffer;
 static int nconn;
 static struct timespec c_begin;
-static struct timespec c_end;
-static struct timespec c_diff;
+static struct timespec watch_interval;
 
 static void handler(int signum) {
     debug("%s received (%d)", strsignal(signum), signum);
@@ -30,8 +31,48 @@ static void handler(int signum) {
     }
 }
 
+static struct timespec timediff(const struct timespec * ts1, const struct timespec * ts2) {
+    struct timespec r = { ts1->tv_sec - ts2->tv_sec, ts1->tv_nsec - ts2->tv_nsec };
+
+    if (r.tv_nsec < 0) {
+        r.tv_sec--;
+        r.tv_nsec += 1000000000;
+    }
+
+    return r;
+}
+
+void * monitor(void * args) {
+    size_t bytes_old = 0;
+    size_t bytes_cur;
+    size_t bytes_diff;
+    struct timespec c_old = { 0, 0 };
+    struct timespec c_cur;
+    struct timespec c_diff;
+    double bps;
+
+    clock_gettime(CLOCK_MONOTONIC, &c_cur);
+
+    while (1) {
+        nanosleep(&watch_interval, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &c_cur);
+        bytes_cur = acc_recv;
+        bytes_diff = bytes_cur - bytes_old;
+        c_diff = timediff(&c_cur, &c_old);
+        bps = perf_bps(bytes_diff, c_diff);
+
+        printf("\r\e[2KTotal: %.3f MB. Performance: %.3f Mbps", bytes_cur / 1048536.0, bps / 1000000);
+        fflush(stdout);
+
+        c_old = c_cur;
+        bytes_old = bytes_cur;
+    }
+
+    return args;
+}
+
 void help(const char * argv0, int result) {
-    print("Syntax: %s [ -d ] [ -h ] [ -l <ms> ] [ -p <port> ] [ -v ]", argv0);
+    print("Syntax: %s [ -d ] [ -h ] [ -l <ms> ] [ -p <port> ] [ -v ] [ -w <sec> ]", argv0);
     print("");
     print("    -d          Debug mode.");
     print("    -h          This help.");
@@ -39,6 +80,7 @@ void help(const char * argv0, int result) {
     print("    -p <port>   Port number.");
     print("    -t <ms>     Receiving timeout. Default: infinity.");
     print("    -v          Verbose mode (show messages).");
+    print("    -w <sec>    Enable watcher with interval of <sec> seconds.");
     exit(result);
 }
 
@@ -46,8 +88,9 @@ static void options(int argc, char * const argv[]) {
     int c;
     long ms;
     int _port;
+    double seconds;
 
-    while (c = getopt(argc, argv, "dhl:p:t:v"), c != -1) {
+    while (c = getopt(argc, argv, "dhl:p:t:vw:"), c != -1) {
         switch (c) {
         case 'd':
             debug_flag = 1;
@@ -104,6 +147,16 @@ static void options(int argc, char * const argv[]) {
             verbose_flag = 1;
             break;
 
+        case 'w':
+            if (seconds = atof(optarg), seconds <= 0) {
+                error("Option -%c requires a positive argument.", c);
+                continue;
+            }
+
+            watch_interval.tv_sec = seconds;
+            watch_interval.tv_nsec = (seconds - (long)seconds) * 1000000000;
+            break;
+
         default:
             help(argv[0], 1);
         }
@@ -133,7 +186,7 @@ int dispatch(int sock, char * data, unsigned long size) {
             return -1;
         }
     } else {
-        verbose("Received from %d: %.10s (%lu)", sock, data, size);
+        debug("Received from %d: %.10s (%lu)", sock, data, size);
 
         if (delay.tv_sec || delay.tv_nsec) {
             nanosleep(&delay, NULL);
@@ -152,6 +205,8 @@ int main(int argc, char ** argv) {
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
     struct epoll_event request = { .events = EPOLLIN };
     struct epoll_event events[POLL_SIZE] = { { .events = 0 } };
+    struct timespec c_end;
+    struct timespec c_diff;
 
     options(argc, argv);
     signal(SIGINT, handler);
@@ -208,6 +263,21 @@ int main(int argc, char ** argv) {
         return EXIT_FAILURE;
     }
 
+    if (watch_interval.tv_sec || watch_interval.tv_nsec) {
+        pthread_t thread;
+        pthread_attr_t attr;
+
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, 1);
+
+        if (pthread_create(&thread, &attr, monitor, NULL) < 0) {
+            error("pthread_create(monitor)");
+            return EXIT_FAILURE;
+        }
+
+        pthread_attr_destroy(&attr);
+    }
+
     while (running) {
         nevents = epoll_wait(epfd, events, POLL_SIZE, -1);
 
@@ -234,7 +304,7 @@ int main(int argc, char ** argv) {
                 }
 
                 nb_open(&netbuffer, request.data.fd);
-                info("New connection: %d (%d)", request.data.fd, nconn);
+                verbose("New connection: %d (%d)", request.data.fd, nconn);
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, request.data.fd, &request) < 0) {
                     error2("epoll_ctl() [2]");
@@ -245,12 +315,20 @@ int main(int argc, char ** argv) {
 
                 switch (nrecv) {
                 case -1:
-                    error2("recv(%d)", events[i].data.fd);
+                    switch (errno) {
+                    case ECONNRESET:
+                        verbose("Socket %d closed (%d).", events[i].data.fd, nconn);
+                        break;
+
+                    default:
+                        error2("recv(%d)", events[i].data.fd);
+                    }
+
                     nb_close(&netbuffer, events[i].data.fd);
                     break;
 
                 case 0:
-                    info("Socket %d closed (%d).", events[i].data.fd, nconn);
+
                     nb_close(&netbuffer, events[i].data.fd);
                     break;
                 }
@@ -260,19 +338,12 @@ int main(int argc, char ** argv) {
 
     clock_gettime(CLOCK_MONOTONIC, &c_end);
 
-    c_diff.tv_sec = c_end.tv_sec - c_begin.tv_sec;
-    c_diff.tv_nsec = c_end.tv_nsec - c_begin.tv_nsec;
-
-    if (c_diff.tv_nsec < 0) {
-        c_diff.tv_sec--;
-        c_diff.tv_nsec += 1000000000;
-    }
-
     close(sock);
     close(epfd);
     info("Data received: %zu MB", acc_recv / 1000000);
 
     if (c_begin.tv_sec) {
+        c_diff = timediff(&c_end, &c_begin);
         info("Time: %f sec.", (c_diff.tv_sec + (double)c_diff.tv_nsec / 1000000000));
         info("Throughput: %f Mbps.", (double)acc_recv / (c_diff.tv_sec * 1000000 + (double)c_diff.tv_nsec / 1000000) * 8);
     }
