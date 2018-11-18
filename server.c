@@ -1,6 +1,7 @@
 #include "tcpconn.h"
 
 #define perf_bps(bytes, ts) (bytes * 8 / (ts.tv_sec + ts.tv_nsec / 1000000000.0))
+#define perf_eps(events, ts) (events / (ts.tv_sec + ts.tv_nsec / 1000000000.0))
 
 static volatile int running = 1;
 static int debug_flag;
@@ -8,7 +9,8 @@ static int verbose_flag;
 static struct timespec delay;
 static in_port_t port = DEF_PORT;
 static struct timeval timeout;
-static volatile size_t acc_recv;
+static volatile size_t acc_bytes;
+static volatile size_t acc_events;
 static netbuffer_t netbuffer;
 static int nconn;
 static struct timespec c_begin;
@@ -46,28 +48,39 @@ void * monitor(void * args) {
     size_t bytes_old = 0;
     size_t bytes_cur;
     size_t bytes_diff;
+    size_t events_old = 0;
+    size_t events_cur;
+    size_t events_diff;
     struct timespec c_old = { 0, 0 };
     struct timespec c_cur;
     struct timespec c_diff;
     double bps;
+    double eps;
     const char * U_TOTAL[] = { "B", "KB", "MB", "GB", "TB" };
     const char * U_PERF[] = { "bps", "Kbps", "Mbps", "Gbps" };
+    const char * U_THROUGHPUT[] = { "eps", "Keps", "Meps", "Geps" };
     double p_total;
     double p_perf;
+    double p_throughput;
     int i_total;
     int i_perf;
+    int i_throughput;
 
     clock_gettime(CLOCK_MONOTONIC, &c_cur);
 
     while (1) {
         nanosleep(&watch_interval, NULL);
         clock_gettime(CLOCK_MONOTONIC, &c_cur);
-        bytes_cur = acc_recv;
+        bytes_cur = acc_bytes;
         bytes_diff = bytes_cur - bytes_old;
         c_diff = timediff(&c_cur, &c_old);
         bps = perf_bps(bytes_diff, c_diff);
+        events_cur = acc_events;
+        events_diff = events_cur - events_old;
+        eps = perf_eps(events_diff, c_diff);
         p_total = bytes_cur;
         p_perf = bps;
+        p_throughput = eps;
 
         for (i_total = 0; i_total < 5 && p_total >= 1024; ++i_total) {
             p_total /= 1024;
@@ -77,11 +90,16 @@ void * monitor(void * args) {
             p_perf /= 1000;
         }
 
-        printf("\r\e[2KTotal: %.3f %s. Performance: %.3f %s", p_total, U_TOTAL[i_total], p_perf, U_PERF[i_perf]);
+        for (i_throughput = 0; i_throughput < 4 && p_throughput >= 1000; ++i_throughput) {
+            p_throughput /= 1000;
+        }
+
+        printf("\r\e[2KTotal: %.3f %s. Performance: %.3f %s. Throughput: %.3f %s", p_total, U_TOTAL[i_total], p_perf, U_PERF[i_perf], p_throughput, U_THROUGHPUT[i_throughput]);
         fflush(stdout);
 
         c_old = c_cur;
         bytes_old = bytes_cur;
+        events_old = events_cur;
     }
 
     return args;
@@ -184,6 +202,8 @@ int dispatch(int sock, char * data, unsigned long size) {
     uint32_t * header;
     long nsend;
     char buffer[BUF_SIZE + 1];
+
+    acc_events++;
 
     if (strncmp(data, HC_STARTUP, strlen(HC_STARTUP)) == 0) {
         debug("Client %d sent startup.", sock);
@@ -356,12 +376,13 @@ int main(int argc, char ** argv) {
 
     close(sock);
     close(epfd);
-    info("Data received: %zu MB", acc_recv / 1000000);
+    info("Data received: %zu events, %zu MB", acc_events, acc_bytes / 1000000);
 
     if (c_begin.tv_sec) {
         c_diff = timediff(&c_end, &c_begin);
         info("Time: %f sec.", (c_diff.tv_sec + (double)c_diff.tv_nsec / 1000000000));
-        info("Throughput: %f Mbps.", (double)acc_recv / (c_diff.tv_sec * 1000000 + (double)c_diff.tv_nsec / 1000000) * 8);
+        info("Performance: %f Mbps.", perf_bps(acc_bytes, c_diff) / 1000000);
+        info("Throughput: %f Keps.", perf_eps(acc_events / 1000, c_diff));
     }
 
     verbose("Exiting.");
@@ -416,7 +437,7 @@ int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * da
         return recv_len;
     }
 
-    acc_recv += recv_len;
+    acc_bytes += recv_len;
     buffer->data_len += recv_len;
 
     // Dispatch as most messages as possible
