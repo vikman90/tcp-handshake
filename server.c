@@ -456,10 +456,14 @@ int nb_recv(sockbuffer_t * buffer, int sock, int (*callback)(int sock, char * da
 
     // Move remaining data to data start
 
-    if (i > 0 && i < buffer->data_len) {
+    if (i > 0) {
         debug("i = %lu, len = %lu, size = %lu", i, buffer->data_len, buffer->data_size);
-        debug("moving %d bytes", (int)(buffer->data_len - i));
-        memcpy(buffer->data, buffer->data + i, buffer->data_len - i);
+
+        if (i < buffer->data_len) {
+            debug("moving %d bytes", (int)(buffer->data_len - i));
+            memcpy(buffer->data, buffer->data + i, buffer->data_len - i);
+        }
+
         buffer->data_len -= i;
     }
 
