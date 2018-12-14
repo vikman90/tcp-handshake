@@ -10,6 +10,7 @@ static char * hostname;
 static int sock = -1;
 static in_port_t port = DEF_PORT;
 static struct timeval timeout;
+static int force_connection;
 
 static void handler(int signum) {
     debug("%s received (%d)", strsignal(signum), signum);
@@ -28,9 +29,10 @@ static void handler(int signum) {
 }
 
 void help(const char * argv0, int result) {
-    print("Syntax: %s [ -d ] [ -h ] [ -i <IP> ] [ -n <host> ] [ -p <port> ] [ -s <size> ] [ -t <ms> ] [ -v ]", argv0);
+    print("Syntax: %s [ -d ] [ -f ] [ -h ] [ -i <IP> ] [ -n <host> ] [ -p <port> ] [ -s <size> ] [ -t <ms> ] [ -v ]", argv0);
     print("");
     print("    -d          Debug mode.");
+    print("    -f          Force connection (no handshake).");
     print("    -h          This help.");
     print("    -i <IP>     IP address.");
     print("    -l <ms>     Message latency. Default: 10 ms.");
@@ -48,10 +50,14 @@ static void options(int argc, char * const argv[]) {
     int _port;
     int size;
 
-    while (c = getopt(argc, argv, "dhi:l:n:p:s:t:v"), c != -1) {
+    while (c = getopt(argc, argv, "dfhi:l:n:p:s:t:v"), c != -1) {
         switch (c) {
         case 'd':
             debug_flag = 1;
+            break;
+
+        case 'f':
+            force_connection = 1;
             break;
 
         case 'h':
@@ -232,6 +238,11 @@ void server_handshake() {
             sleep(1);
             server_connect();
             continue;
+        }
+
+        if (force_connection) {
+            print("Connected to server!");
+            return;
         }
 
         debug("recv()");
